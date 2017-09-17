@@ -1,7 +1,7 @@
 apply plugin: 'com.android.application'
 
 android {
-    compileSdkVersion 25
+    compileSdkVersion 26
     buildToolsVersion "26.0.1"
     defaultConfig {
         applicationId "com.ptrprograms.smartfan"
@@ -20,11 +20,17 @@ android {
 }
 
 dependencies {
+    compile project(':grpc')
     compile fileTree(dir: 'libs', include: ['*.jar'])
-    androidTestCompile('com.android.support.test.espresso:espresso-core:2.2.2', {
-        exclude group: 'com.android.support', module: 'support-annotations'
-    })
-    provided 'com.google.android.things:androidthings:+'
-    testCompile 'junit:junit:4.12'
-    compile 'com.android.support.constraint:constraint-layout:1.0.2'
+
+    compile 'com.google.android.things.contrib:driver-button:0.4'
+
+    compile('com.google.auth:google-auth-library-oauth2-http:0.6.0') {
+        exclude group: 'org.apache.httpcomponents', module: 'httpclient'
+    }
+
+    provided 'com.google.android.things:androidthings:0.3.1-devpreview'
+    compile 'com.google.firebase:firebase-database:11.2.2'
 }
+
+apply plugin: 'com.google.gms.google-services'
