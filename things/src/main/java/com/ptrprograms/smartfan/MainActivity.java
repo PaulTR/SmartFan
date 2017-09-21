@@ -1,7 +1,11 @@
 package com.ptrprograms.smartfan;
 
 import android.app.Activity;
+import android.app.PendingIntent;
+import android.content.BroadcastReceiver;
 import android.content.Context;
+import android.content.Intent;
+import android.content.IntentFilter;
 import android.content.SharedPreferences;
 import android.media.AudioFormat;
 import android.media.AudioManager;
@@ -12,8 +16,18 @@ import android.os.Bundle;
 import android.os.Handler;
 import android.os.HandlerThread;
 import android.preference.PreferenceManager;
+import android.support.annotation.NonNull;
+import android.support.annotation.Nullable;
+import android.text.TextUtils;
 import android.util.Log;
 
+import com.google.android.gms.awareness.Awareness;
+import com.google.android.gms.awareness.fence.AwarenessFence;
+import com.google.android.gms.awareness.fence.FenceState;
+import com.google.android.gms.awareness.fence.FenceUpdateRequest;
+import com.google.android.gms.awareness.fence.TimeFence;
+import com.google.android.gms.common.ConnectionResult;
+import com.google.android.gms.common.api.GoogleApiClient;
 import com.google.android.things.contrib.driver.button.Button;
 import com.google.android.things.pio.Gpio;
 import com.google.android.things.pio.PeripheralManagerService;
@@ -35,17 +49,28 @@ import org.json.JSONException;
 
 import java.io.IOException;
 import java.nio.ByteBuffer;
+import java.util.TimeZone;
 
 import io.grpc.ManagedChannel;
 import io.grpc.ManagedChannelBuilder;
 import io.grpc.auth.MoreCallCredentials;
 import io.grpc.stub.StreamObserver;
 
-public class MainActivity extends Activity implements Button.OnButtonEventListener {
+public class MainActivity extends Activity implements Button.OnButtonEventListener, GoogleApiClient.ConnectionCallbacks, GoogleApiClient.OnConnectionFailedListener {
 
     private static final String FAN_URL = "https://smart-fan.firebaseio.com/";
     private static final String FAN_STATE_GPIO_PIN = "BCM18";
     private static final String ASSISTANT_BUTTON_GPIO_PIN = "BCM23";
+
+    //Awareness API values
+    private static final String TIME_FENCE_KEY = "time_fence_key";
+    private final String FENCE_RECEIVER_ACTION = "FENCE_RECEIVER_ACTION";
+    private GoogleApiClient googleApiClient;
+    private PendingIntent pendingIntent;
+    private FenceReceiver fenceReceiver;
+
+    private static final int START_WINDOW_IN_MILLIS = 0;
+    private static final int END_WINDOW_IN_MILLIS = 75600000;
 
     private DatabaseReference databaseRef;
     private Gpio fanStateSignal;
@@ -104,25 +129,15 @@ public class MainActivity extends Activity implements Button.OnButtonEventListen
                         case EVENT_TYPE:
                             break;
                         case RESULT:
-                            final String spokenRequestText = value.getResult().getSpokenRequestText();
-                            Log.e("Test", "text: " + spokenRequestText);
-                            if( spokenRequestText.contains("fan") && spokenRequestText.contains("on") ) {
-                                smartFanStates.setFanOn(true);
-                                databaseRef.setValue(smartFanStates);
-                            } else if( spokenRequestText.contains("fan") && spokenRequestText.contains("off") ) {
-                                smartFanStates.setFanOn(false);
-                                databaseRef.setValue(smartFanStates);
-                            } else {
-                                mConversationState = value.getResult().getConversationState();
-                                if (value.getResult().getVolumePercentage() != 0) {
-                                    mVolumePercentage = value.getResult().getVolumePercentage();
-                                    float newVolume = AudioTrack.getMaxVolume() * mVolumePercentage / 100.0f;
-                                    mAudioTrack.setVolume(newVolume);
-                                    SharedPreferences.Editor editor = PreferenceManager.
-                                            getDefaultSharedPreferences(MainActivity.this).edit();
-                                    editor.putFloat(PREF_CURRENT_VOLUME, newVolume);
-                                    editor.apply();
-                                }
+                            mConversationState = value.getResult().getConversationState();
+                            if (value.getResult().getVolumePercentage() != 0) {
+                                mVolumePercentage = value.getResult().getVolumePercentage();
+                                float newVolume = AudioTrack.getMaxVolume() * mVolumePercentage / 100.0f;
+                                mAudioTrack.setVolume(newVolume);
+                                SharedPreferences.Editor editor = PreferenceManager.
+                                        getDefaultSharedPreferences(MainActivity.this).edit();
+                                editor.putFloat(PREF_CURRENT_VOLUME, newVolume);
+                                editor.apply();
                             }
                             break;
                         case AUDIO_OUT:
@@ -209,7 +224,32 @@ public class MainActivity extends Activity implements Button.OnButtonEventListen
 
         initFirebase();
         initFanSignals();
+        initPlayServices();
+    }
 
+    private void initPlayServices() {
+        Log.e("Test", "initplayservices");
+        googleApiClient = new GoogleApiClient.Builder(this)
+                .addApi(Awareness.API)
+                .addConnectionCallbacks(this)
+                .addOnConnectionFailedListener(this)
+                .build();
+    }
+
+    @Override
+    protected void onStop() {
+        Awareness.FenceApi.updateFences(
+                googleApiClient,
+                new FenceUpdateRequest.Builder()
+                        .removeFence(TIME_FENCE_KEY)
+                        .build());
+
+        googleApiClient.disconnect();
+        if (fenceReceiver != null) {
+            unregisterReceiver(fenceReceiver);
+        }
+
+        super.onStop();
     }
 
     private void initAssistantThread() {
@@ -259,12 +299,19 @@ public class MainActivity extends Activity implements Button.OnButtonEventListen
         databaseRef.addValueEventListener(new ValueEventListener() {
             @Override
             public void onDataChange(DataSnapshot dataSnapshot) {
+
                 smartFanStates = dataSnapshot.getValue(SmartFan.class);
+
                 try {
                     fanStateSignal.setValue(smartFanStates.isFanOn());
                 } catch( IOException e ) {
 
                 }
+
+                if( !googleApiClient.isConnected() && !googleApiClient.isConnecting() ) {
+                    googleApiClient.connect();
+                }
+
             }
 
             @Override
@@ -340,5 +387,62 @@ public class MainActivity extends Activity implements Button.OnButtonEventListen
             }
         });
         mAssistantThread.quitSafely();
+    }
+
+    @Override
+    public void onConnected(@Nullable Bundle bundle) {
+        Log.e("Test", "onconnected");
+        Intent intent = new Intent(FENCE_RECEIVER_ACTION);
+        pendingIntent =
+                PendingIntent.getBroadcast(MainActivity.this, 0, intent, 0);
+
+        fenceReceiver = new FenceReceiver();
+        registerReceiver(fenceReceiver, new IntentFilter(FENCE_RECEIVER_ACTION));
+        setupFences();
+    }
+
+    private void turnOnFan() {
+        smartFanStates.setFanOn(true);
+        databaseRef.setValue(smartFanStates);
+
+        try {
+            fanStateSignal.setValue(true);
+        } catch( IOException e ) {
+
+        }
+    }
+
+    @SuppressWarnings({"MissingPermission"})
+    private void setupFences() {
+        AwarenessFence timeFence = TimeFence.inDailyInterval(TimeZone.getDefault(), START_WINDOW_IN_MILLIS, END_WINDOW_IN_MILLIS);
+
+        Awareness.FenceApi.updateFences(
+                googleApiClient,
+                new FenceUpdateRequest.Builder()
+                        .addFence(TIME_FENCE_KEY, timeFence, pendingIntent)
+                        .build());
+    }
+
+    @Override
+    public void onConnectionFailed(@NonNull ConnectionResult connectionResult) {
+        Log.e("Test", "onconnectionfailed: " + connectionResult.getErrorCode());
+    }
+
+    public class FenceReceiver extends BroadcastReceiver {
+
+        @Override
+        public void onReceive(Context context, Intent intent) {
+            FenceState fenceState = FenceState.extract(intent);
+            if (TextUtils.equals(fenceState.getFenceKey(), TIME_FENCE_KEY)) {
+                if( fenceState.getCurrentState() == FenceState.TRUE && (smartFanStates != null && smartFanStates.isAutoOn())) {
+                    turnOnFan();
+                }
+            }
+        }
+    }
+
+    @Override
+    public void onConnectionSuspended(int i) {
+
     }
 }
