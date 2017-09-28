@@ -13,7 +13,7 @@
 
         <meta-data
             android:name="com.google.android.awareness.API_KEY"
-            android:value=""/>
+            android:value="AIzaSyB2CUkxkKiYJkdFXZpcd0ONuSJfM4R9LMc"/>
 
         <activity android:name=".MainActivity">
             <intent-filter>
