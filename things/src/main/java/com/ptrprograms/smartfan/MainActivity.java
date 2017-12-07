@@ -8,13 +8,8 @@ import android.content.Intent;
 import android.content.IntentFilter;
 import android.content.SharedPreferences;
 import android.media.AudioFormat;
-import android.media.AudioManager;
-import android.media.AudioRecord;
-import android.media.AudioTrack;
-import android.media.MediaRecorder;
 import android.os.Bundle;
 import android.os.Handler;
-import android.os.HandlerThread;
 import android.preference.PreferenceManager;
 import android.support.annotation.NonNull;
 import android.support.annotation.Nullable;
@@ -31,36 +26,41 @@ import com.google.android.gms.common.api.GoogleApiClient;
 import com.google.android.things.contrib.driver.button.Button;
 import com.google.android.things.pio.Gpio;
 import com.google.android.things.pio.PeripheralManagerService;
-import com.google.assistant.embedded.v1alpha1.AudioInConfig;
-import com.google.assistant.embedded.v1alpha1.AudioOutConfig;
-import com.google.assistant.embedded.v1alpha1.ConverseConfig;
-import com.google.assistant.embedded.v1alpha1.ConverseRequest;
+import com.google.android.things.pio.UartDevice;
+import com.google.android.things.pio.UartDeviceCallback;
 import com.google.assistant.embedded.v1alpha1.ConverseResponse;
-import com.google.assistant.embedded.v1alpha1.ConverseState;
-import com.google.assistant.embedded.v1alpha1.EmbeddedAssistantGrpc;
+import com.google.auth.oauth2.UserCredentials;
 import com.google.firebase.database.DataSnapshot;
 import com.google.firebase.database.DatabaseError;
 import com.google.firebase.database.DatabaseReference;
 import com.google.firebase.database.FirebaseDatabase;
 import com.google.firebase.database.ValueEventListener;
-import com.google.protobuf.ByteString;
+import com.google.rpc.Status;
 
 import org.json.JSONException;
 
 import java.io.IOException;
 import java.nio.ByteBuffer;
+import java.nio.charset.Charset;
 import java.util.TimeZone;
 
-import io.grpc.ManagedChannel;
-import io.grpc.ManagedChannelBuilder;
-import io.grpc.auth.MoreCallCredentials;
-import io.grpc.stub.StreamObserver;
+import static android.content.ContentValues.TAG;
 
 public class MainActivity extends Activity implements Button.OnButtonEventListener, GoogleApiClient.ConnectionCallbacks, GoogleApiClient.OnConnectionFailedListener {
+
+    private static final char LED_RING_CODE_CONVO_START = 'S';
+    private static final char LED_RING_CODE_OFF = 'F';
+    private static final char LED_RING_CODE_ON = 'O';
 
     private static final String FAN_URL = "https://smart-fan.firebaseio.com/";
     private static final String FAN_STATE_GPIO_PIN = "BCM18";
     private static final String ASSISTANT_BUTTON_GPIO_PIN = "BCM23";
+
+    // Audio constants.
+    private static final String PREF_CURRENT_VOLUME = "current_volume";
+    private static final int SAMPLE_RATE = 16000;
+    private static final int ENCODING = AudioFormat.ENCODING_PCM_16BIT;
+    private static final int DEFAULT_VOLUME = 100;
 
     //Awareness API values
     private static final String TIME_FENCE_KEY = "time_fence_key";
@@ -76,29 +76,10 @@ public class MainActivity extends Activity implements Button.OnButtonEventListen
     private Gpio fanStateSignal;
     private SmartFan smartFanStates;
     private Button mButton;
+    private UartDevice arduinoDevice;
 
-    private static final String ASSISTANT_ENDPOINT = "embeddedassistant.googleapis.com";
-
+    // Peripheral and drivers constants.
     private static final int BUTTON_DEBOUNCE_DELAY_MS = 20;
-    private static final String PREF_CURRENT_VOLUME = "current_volume";
-    private static final int SAMPLE_RATE = 16000;
-    private static final int ENCODING = AudioFormat.ENCODING_PCM_16BIT;
-    private static final int DEFAULT_VOLUME = 100;
-    private static final int SAMPLE_BLOCK_SIZE = 1024;
-
-    private AudioTrack mAudioTrack;
-    private AudioRecord mAudioRecord;
-    private int mVolumePercentage = DEFAULT_VOLUME;
-
-    private ByteString mConversationState = null;
-    private HandlerThread mAssistantThread;
-    private Handler mAssistantHandler;
-
-    private static AudioInConfig.Encoding ENCODING_INPUT = AudioInConfig.Encoding.LINEAR16;
-    private static AudioOutConfig.Encoding ENCODING_OUTPUT = AudioOutConfig.Encoding.LINEAR16;
-
-    private EmbeddedAssistantGrpc.EmbeddedAssistantStub mAssistantService;
-    private StreamObserver<ConverseRequest> mAssistantRequestObserver;
 
     private static final AudioFormat AUDIO_FORMAT_STEREO =
             new AudioFormat.Builder()
@@ -107,124 +88,59 @@ public class MainActivity extends Activity implements Button.OnButtonEventListen
                     .setSampleRate(SAMPLE_RATE)
                     .build();
 
-    private static final AudioFormat AUDIO_FORMAT_OUT_MONO =
-            new AudioFormat.Builder()
-                    .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
-                    .setEncoding(ENCODING)
-                    .setSampleRate(SAMPLE_RATE)
-                    .build();
+    private Handler mMainHandler;
 
-    private static final AudioFormat AUDIO_FORMAT_IN_MONO =
-            new AudioFormat.Builder()
-                    .setChannelMask(AudioFormat.CHANNEL_IN_MONO)
-                    .setEncoding(ENCODING)
-                    .setSampleRate(SAMPLE_RATE)
-                    .build();
+    // List & adapter to store and display the history of Assistant Requests.
+    private EmbeddedAssistant mEmbeddedAssistant;
 
-    private StreamObserver<ConverseResponse> mAssistantResponseObserver =
-            new StreamObserver<ConverseResponse>() {
-                @Override
-                public void onNext(ConverseResponse value) {
-                    switch (value.getConverseResponseCase()) {
-                        case EVENT_TYPE:
-                            break;
-                        case RESULT:
-                            mConversationState = value.getResult().getConversationState();
-                            if (value.getResult().getVolumePercentage() != 0) {
-                                mVolumePercentage = value.getResult().getVolumePercentage();
-                                float newVolume = AudioTrack.getMaxVolume() * mVolumePercentage / 100.0f;
-                                mAudioTrack.setVolume(newVolume);
-                                SharedPreferences.Editor editor = PreferenceManager.
-                                        getDefaultSharedPreferences(MainActivity.this).edit();
-                                editor.putFloat(PREF_CURRENT_VOLUME, newVolume);
-                                editor.apply();
-                            }
-                            break;
-                        case AUDIO_OUT:
-                            final ByteBuffer audioData =
-                                    ByteBuffer.wrap(value.getAudioOut().getAudioData().toByteArray());
-                            mAudioTrack.write(audioData, audioData.remaining(), AudioTrack.WRITE_BLOCKING);
-                            break;
-                        case ERROR:
-                            break;
-                    }
-                }
-
-                @Override
-                public void onError(Throwable t) {}
-
-                @Override
-                public void onCompleted() {}
-            };
-
-    private Runnable mStartAssistantRequest = new Runnable() {
-        @Override
-        public void run() {
-            mAudioRecord.startRecording();
-            mAssistantRequestObserver = mAssistantService.converse(mAssistantResponseObserver);
-            ConverseConfig.Builder converseConfigBuilder =
-                    ConverseConfig.newBuilder()
-                            .setAudioInConfig(AudioInConfig.newBuilder()
-                                    .setEncoding(ENCODING_INPUT)
-                                    .setSampleRateHertz(SAMPLE_RATE)
-                                    .build())
-                            .setAudioOutConfig(AudioOutConfig.newBuilder()
-                                    .setEncoding(ENCODING_OUTPUT)
-                                    .setSampleRateHertz(SAMPLE_RATE)
-                                    .setVolumePercentage(mVolumePercentage)
-                                    .build());
-            if (mConversationState != null) {
-                converseConfigBuilder.setConverseState(
-                        ConverseState.newBuilder()
-                                .setConversationState(mConversationState)
-                                .build());
-            }
-
-            mAssistantRequestObserver.onNext(ConverseRequest.newBuilder()
-                    .setConfig(converseConfigBuilder.build())
-                    .build());
-            mAssistantHandler.post(mStreamAssistantRequest);
-        }
-    };
-    private Runnable mStreamAssistantRequest = new Runnable() {
-        @Override
-        public void run() {
-            ByteBuffer audioData = ByteBuffer.allocateDirect(SAMPLE_BLOCK_SIZE);
-            int result =
-                    mAudioRecord.read(audioData, audioData.capacity(), AudioRecord.READ_BLOCKING);
-            if (result <= 0) {
-                return;
-            }
-            mAssistantRequestObserver.onNext(ConverseRequest.newBuilder()
-                    .setAudioIn(ByteString.copyFrom(audioData))
-                    .build());
-            mAssistantHandler.post(mStreamAssistantRequest);
-        }
-    };
-    private Runnable mStopAssistantRequest = new Runnable() {
-        @Override
-        public void run() {
-            mAssistantHandler.removeCallbacks(mStreamAssistantRequest);
-            if (mAssistantRequestObserver != null) {
-                mAssistantRequestObserver.onCompleted();
-                mAssistantRequestObserver = null;
-            }
-            mAudioRecord.stop();
-            mAudioTrack.play();
-        }
-    };
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
 
-        initAssistantThread();
+        initArduino();
         initAssistantButton();
         initAudio();
-
         initFirebase();
         initFanSignals();
         initPlayServices();
+    }
+
+    private void writeCodeToArduino(char code) {
+        try {
+            byte[] data = new byte[1];
+            data[0] = (byte) code;
+            arduinoDevice.write(data, data.length);
+        } catch(IOException e) {
+            Log.e("Test", "exception writing to Arduino");
+        }
+    }
+
+    private void initArduino() {
+        PeripheralManagerService service = new PeripheralManagerService();
+        try {
+            arduinoDevice = service.openUartDevice("UART0");
+            arduinoDevice.setBaudrate(9600);
+            arduinoDevice.setDataSize(8);
+            arduinoDevice.setParity(UartDevice.PARITY_NONE);
+            arduinoDevice.setStopBits(1);
+
+            arduinoDevice.registerUartDeviceCallback(new UartDeviceCallback() {
+                @Override
+                public boolean onUartDeviceDataAvailable(UartDevice uart) {
+                    byte[] buffer = new byte[1];
+                    try {
+                        uart.read(buffer, 1);
+                        Log.e("Test", "received code: " + new String(buffer, Charset.forName("UTF-8")));
+                    } catch( IOException e ) {
+
+                    }
+                    return super.onUartDeviceDataAvailable(uart);
+                }
+            });
+        } catch( IOException e ) {
+            Log.e("Test", "error on initializing arduino");
+        }
     }
 
     private void initPlayServices() {
@@ -234,6 +150,77 @@ public class MainActivity extends Activity implements Button.OnButtonEventListen
                 .addConnectionCallbacks(this)
                 .addOnConnectionFailedListener(this)
                 .build();
+    }
+
+    private void initAudio() {
+        SharedPreferences preferences = PreferenceManager.getDefaultSharedPreferences(this);
+        int initVolume = preferences.getInt(PREF_CURRENT_VOLUME, DEFAULT_VOLUME);
+
+        UserCredentials userCredentials = null;
+        try {
+            userCredentials =
+                    EmbeddedAssistant.generateCredentials(this, R.raw.credentials);
+        } catch (IOException | JSONException e) {
+        }
+        mEmbeddedAssistant = new EmbeddedAssistant.Builder()
+                .setCredentials(userCredentials)
+                .setAudioSampleRate(SAMPLE_RATE)
+                .setAudioVolume(initVolume)
+                .setRequestCallback(new EmbeddedAssistant.RequestCallback() {
+                    @Override
+                    public void onRequestStart() {
+                        writeCodeToArduino(LED_RING_CODE_CONVO_START);
+                    }
+
+                    @Override
+                    public void onSpeechRecognition(String utterance) {
+
+                    }
+                })
+                .setConversationCallback(new EmbeddedAssistant.ConversationCallback() {
+                    @Override
+                    public void onConversationEvent(ConverseResponse.EventType eventType) {
+                        Log.d(TAG, "converse response event: " + eventType);
+                    }
+
+                    @Override
+                    public void onAudioSample(ByteBuffer audioSample) {
+
+                    }
+
+                    @Override
+                    public void onConversationError(Status error) {
+                        Log.e(TAG, "converse response error: " + error);
+                    }
+
+                    @Override
+                    public void onError(Throwable throwable) {
+                        Log.e(TAG, "converse error:", throwable);
+                    }
+
+                    @Override
+                    public void onVolumeChanged(int percentage) {
+                        Log.i(TAG, "assistant volume changed: " + percentage);
+                        // Update our shared preferences
+                        SharedPreferences.Editor editor = PreferenceManager
+                                .getDefaultSharedPreferences(MainActivity.this)
+                                .edit();
+                        editor.putInt(PREF_CURRENT_VOLUME, percentage);
+                        editor.apply();
+                    }
+
+                    @Override
+                    public void onConversationFinished() {
+                        if( smartFanStates.isFanOn() ) {
+                            writeCodeToArduino(LED_RING_CODE_ON);
+                        } else {
+                            writeCodeToArduino(LED_RING_CODE_OFF);
+                        }
+                    }
+                })
+                .build();
+
+        mEmbeddedAssistant.connect();
     }
 
     @Override
@@ -252,48 +239,6 @@ public class MainActivity extends Activity implements Button.OnButtonEventListen
         super.onStop();
     }
 
-    private void initAssistantThread() {
-        mAssistantThread = new HandlerThread("assistantThread");
-        mAssistantThread.start();
-        mAssistantHandler = new Handler(mAssistantThread.getLooper());
-    }
-
-    private void initAudio() {
-        AudioManager manager = (AudioManager)this.getSystemService(Context.AUDIO_SERVICE);
-        int maxVolume = manager.getStreamMaxVolume(AudioManager.STREAM_MUSIC);
-        manager.setStreamVolume(AudioManager.STREAM_MUSIC, mVolumePercentage * maxVolume / 100, 0);
-        int outputBufferSize = AudioTrack.getMinBufferSize(AUDIO_FORMAT_OUT_MONO.getSampleRate(),
-                AUDIO_FORMAT_OUT_MONO.getChannelMask(),
-                AUDIO_FORMAT_OUT_MONO.getEncoding());
-        mAudioTrack = new AudioTrack.Builder()
-                .setAudioFormat(AUDIO_FORMAT_OUT_MONO)
-                .setBufferSizeInBytes(outputBufferSize)
-                .build();
-        mAudioTrack.play();
-        int inputBufferSize = AudioRecord.getMinBufferSize(AUDIO_FORMAT_STEREO.getSampleRate(),
-                AUDIO_FORMAT_STEREO.getChannelMask(),
-                AUDIO_FORMAT_STEREO.getEncoding());
-        mAudioRecord = new AudioRecord.Builder()
-                .setAudioSource(MediaRecorder.AudioSource.MIC)
-                .setAudioFormat(AUDIO_FORMAT_IN_MONO)
-                .setBufferSizeInBytes(inputBufferSize)
-                .build();
-
-        SharedPreferences preferences = PreferenceManager.getDefaultSharedPreferences(this);
-        float initVolume = preferences.getFloat(PREF_CURRENT_VOLUME, maxVolume);
-        mAudioTrack.setVolume(initVolume);
-
-        mVolumePercentage = Math.round(initVolume * 100.0f / maxVolume);
-
-        ManagedChannel channel = ManagedChannelBuilder.forTarget(ASSISTANT_ENDPOINT).build();
-        try {
-            mAssistantService = EmbeddedAssistantGrpc.newStub(channel)
-                    .withCallCredentials(MoreCallCredentials.from(
-                            Credentials.fromResource(this, R.raw.credentials)
-                    ));
-        } catch (IOException|JSONException e) {}
-    }
-
     private void initFirebase() {
         databaseRef = FirebaseDatabase.getInstance().getReferenceFromUrl(FAN_URL);
         databaseRef.addValueEventListener(new ValueEventListener() {
@@ -304,6 +249,11 @@ public class MainActivity extends Activity implements Button.OnButtonEventListen
 
                 try {
                     fanStateSignal.setValue(smartFanStates.isFanOn());
+                    if( smartFanStates.isFanOn() ) {
+                        writeCodeToArduino('O');
+                    } else {
+                        writeCodeToArduino('Q');
+                    }
                 } catch( IOException e ) {
 
                 }
@@ -344,10 +294,9 @@ public class MainActivity extends Activity implements Button.OnButtonEventListen
 
     @Override
     public void onButtonEvent(Button button, boolean pressed) {
+        Log.e("Test", "button: " + pressed);
         if (pressed) {
-            mAssistantHandler.post(mStartAssistantRequest);
-        } else {
-            mAssistantHandler.post(mStopAssistantRequest);
+            mEmbeddedAssistant.startConversation();
         }
     }
 
@@ -365,14 +314,6 @@ public class MainActivity extends Activity implements Button.OnButtonEventListen
             }
         }
 
-        if (mAudioRecord != null) {
-            mAudioRecord.stop();
-            mAudioRecord = null;
-        }
-        if (mAudioTrack != null) {
-            mAudioTrack.stop();
-            mAudioTrack = null;
-        }
         if (mButton != null) {
             try {
                 mButton.close();
@@ -380,13 +321,8 @@ public class MainActivity extends Activity implements Button.OnButtonEventListen
             mButton = null;
         }
 
-        mAssistantHandler.post(new Runnable() {
-            @Override
-            public void run() {
-                mAssistantHandler.removeCallbacks(mStreamAssistantRequest);
-            }
-        });
-        mAssistantThread.quitSafely();
+        mEmbeddedAssistant.destroy();
+
     }
 
     @Override
